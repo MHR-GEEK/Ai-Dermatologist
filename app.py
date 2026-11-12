@@ -72,7 +72,7 @@ def ollama_headers():
 
 def ollama_chat_request(messages, model=None, images=None, timeout=90):
     base_url = normalize_ollama_base_url()
-    model = model or os.environ.get("OLLAMA_CHAT_MODEL") or os.environ.get("OLLAMA_MODEL") or "gemma3"
+    model = model or os.environ.get("OLLAMA_CHAT_MODEL") or os.environ.get("OLLAMA_MODEL") or "gemma4:31b"
     payload = {
         "model": model,
         "messages": messages,
@@ -203,7 +203,7 @@ def analyze_with_ollama(image_base64, brands):
     prompt = build_analysis_prompt(brands)
     content = ollama_chat_request(
         [{"role": "user", "content": prompt}],
-        model=os.environ.get("OLLAMA_MODEL") or "gemma3",
+        model=os.environ.get("OLLAMA_MODEL") or "gemma4:31b",
         images=[image_base64],
         timeout=120,
     )
