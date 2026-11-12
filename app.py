@@ -1,5 +1,5 @@
-import base64
 import argparse
+import base64
 import json
 import os
 import re
@@ -10,7 +10,6 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request, session
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 BRANDS_FILE = DATA_DIR / "brands.json"
@@ -20,6 +19,7 @@ load_dotenv(BASE_DIR / ".env")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-for-local-dev")
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", str(8 * 1024 * 1024)))
 
 
 def ensure_data_file():
@@ -27,13 +27,7 @@ def ensure_data_file():
     if not BRANDS_FILE.exists():
         BRANDS_FILE.write_text(
             json.dumps(
-                [
-                    "CeraVe",
-                    "Cetaphil",
-                    "La Roche-Posay",
-                    "The Ordinary",
-                    "Neutrogena",
-                ],
+                ["CeraVe", "Cetaphil", "La Roche-Posay", "The Ordinary", "Neutrogena"],
                 indent=2,
             ),
             encoding="utf-8",
@@ -55,20 +49,64 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def image_to_data_url(file_storage):
-    mime_type = file_storage.mimetype or "image/png"
-    image_bytes = file_storage.read()
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+def normalize_ollama_base_url():
+    """Return the Ollama API root, never embedding credentials in the URL."""
+    base_url = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("OLLAMA_BASE_URL is empty. Set it to https://ollama.com or your Ollama host.")
+    # Legacy configuration placed the API key in the URL path. Strip it and use
+    # the dedicated Authorization header instead.
+    base_url = re.sub(r"/(?:api/)?[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}$", "", base_url)
+    if base_url.endswith("/api"):
+        return base_url
+    return f"{base_url}/api"
 
 
-def image_bytes_to_data_url(image_bytes, mime_type):
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+def ollama_headers():
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
-def image_bytes_to_base64(image_bytes):
-    return base64.b64encode(image_bytes).decode("ascii")
+def ollama_chat_request(messages, model=None, images=None, timeout=90):
+    base_url = normalize_ollama_base_url()
+    model = model or os.environ.get("OLLAMA_CHAT_MODEL") or os.environ.get("OLLAMA_MODEL") or "gemma3"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if images:
+        payload["messages"][-1]["images"] = images
+
+    request_obj = urllib.request.Request(
+        f"{base_url}/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=ollama_headers(),
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")[:500]
+        if exc.code in (401, 403):
+            raise RuntimeError("Ollama authentication failed. Replace OLLAMA_API_KEY with a valid key in Vercel Environment Variables.") from exc
+        if exc.code == 404:
+            raise RuntimeError(f"Ollama model or endpoint not found. Check the model name ({model}) and Ollama URL.") from exc
+        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {error_text}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Cannot reach Ollama. Check OLLAMA_BASE_URL and the deployed server's network access.") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("Ollama timed out. Try again or use a faster vision/chat model.") from exc
+
+    content = (data.get("message") or {}).get("content", "").strip()
+    if not content:
+        raise RuntimeError(f"Ollama returned an empty response. Response keys: {', '.join(data.keys())}")
+    return content
 
 
 def fallback_result(message):
@@ -99,10 +137,10 @@ Return strict JSON with this schema:
   "skin_type": "one of: oily, dry, combination, normal, unclear",
   "concerns": ["short visible skincare concerns, or unclear"],
   "sensitivity": "low, moderate, high, or unclear",
-  "psl_score": "subjective PSL-style visual harmony score from 1.0 to 10.0, or unclear",
-  "facial_rating": "brief subjective facial aesthetic rating such as low, average, above average, high, or unclear",
+  "psl_score": "subjective visual harmony score from 1.0 to 10.0, or unclear",
+  "facial_rating": "subjective facial aesthetic rating such as low, average, above average, high, or unclear",
   "image_ratio_score": "visible facial proportion/photo ratio score from 1 to 100, or unclear",
-  "proportion_notes": ["brief notes about visible symmetry, facial thirds, lighting, angle, and photo quality"],
+  "proportion_notes": ["brief notes about visible symmetry, lighting, angle, and photo quality"],
   "routine": [
     {{"step": "AM cleanser", "recommendation": "brand-safe educational recommendation"}},
     {{"step": "AM moisturizer", "recommendation": "brand-safe educational recommendation"}},
@@ -116,18 +154,6 @@ Return strict JSON with this schema:
 """
 
 
-def parse_json_result(raw_text):
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(0)
-    parsed = json.loads(cleaned)
-    return normalize_result(parsed, ai_available=True)
-
-
 def normalize_result(result, ai_available):
     return {
         "ai_available": ai_available,
@@ -137,128 +163,49 @@ def normalize_result(result, ai_available):
         "psl_score": result.get("psl_score", "-"),
         "facial_rating": result.get("facial_rating", "-"),
         "image_ratio_score": result.get("image_ratio_score", "-"),
-        "proportion_notes": result.get("proportion_notes")
-        if isinstance(result.get("proportion_notes"), list)
-        else [],
+        "proportion_notes": result.get("proportion_notes") if isinstance(result.get("proportion_notes"), list) else [],
         "routine": result.get("routine") if isinstance(result.get("routine"), list) else [],
         "notes": result.get("notes", ""),
     }
 
 
-def analyze_with_openai(image_data_url, brands):
-    from openai import OpenAI
-
-    client = OpenAI()
-    prompt = build_analysis_prompt(brands)
-    response = client.responses.create(
-        model=os.environ.get("OPENAI_MODEL", "gpt-5"),
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": image_data_url},
-                ],
-            }
-        ],
-        text={"format": {"type": "json_object"}},
-    )
-    return parse_json_result(response.output_text)
+def parse_json_result(raw_text):
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(0)
+    return normalize_result(json.loads(cleaned), ai_available=True)
 
 
 def analyze_with_ollama(image_base64, brands):
-    base_url = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/api").rstrip("/")
-    if not base_url.endswith("/api"):
-        base_url = f"{base_url}/api"
-    model = os.environ.get("OLLAMA_MODEL", "gemma3")
     prompt = build_analysis_prompt(brands)
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-                "images": [image_base64],
-            }
-        ],
-        "stream": False,
-    }
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get("OLLAMA_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    request_obj = urllib.request.Request(
-        f"{base_url}/chat",
-        data=body,
-        headers=headers,
-        method="POST",
+    content = ollama_chat_request(
+        [{"role": "user", "content": prompt}],
+        model=os.environ.get("OLLAMA_MODEL") or "gemma3",
+        images=[image_base64],
+        timeout=120,
     )
-    try:
-        with urllib.request.urlopen(request_obj, timeout=120) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"AI service returned HTTP {exc.code}: {error_text}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            "Could not reach the AI service. Check your connection and restart the app."
-        ) from exc
-
-    content = data.get("message", {}).get("content", "")
-    if not content:
-        raise RuntimeError(f"AI service returned no message content: {data}")
     return parse_json_result(content)
 
 
 def chat_with_ollama(message):
-    base_url = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/api").rstrip("/")
-    if not base_url.endswith("/api"):
-        base_url = f"{base_url}/api"
-    model = os.environ.get("OLLAMA_CHAT_MODEL", os.environ.get("OLLAMA_MODEL", "gemma3:12b"))
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a very brief AI skincare assistant. Reply in 1 to 2 short sentences. "
-                    "Avoid long lists unless the user asks. Give educational skincare guidance, "
-                    "product routine help, and app usage help. Do not diagnose medical conditions. "
-                    "Tell users to see a dermatologist for urgent, painful, spreading, bleeding, "
-                    "infected, or persistent symptoms."
-                ),
-            },
+    system_prompt = (
+        "You are a helpful, concise AI skincare assistant. Reply clearly and naturally. "
+        "Give educational skincare guidance, product routine help, and app usage help. "
+        "Do not diagnose medical conditions or claim certainty from text alone. "
+        "For urgent, painful, spreading, bleeding, infected, or persistent symptoms, "
+        "recommend a qualified dermatologist."
+    )
+    return ollama_chat_request(
+        [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ],
-        "stream": False,
-    }
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get("OLLAMA_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    request_obj = urllib.request.Request(
-        f"{base_url}/chat",
-        data=body,
-        headers=headers,
-        method="POST",
+        timeout=int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "90")),
     )
-    try:
-        with urllib.request.urlopen(request_obj, timeout=120) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"AI service returned HTTP {exc.code}: {error_text}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError("Could not reach the AI service.") from exc
-
-    content = data.get("message", {}).get("content", "").strip()
-    if not content:
-        raise RuntimeError(f"AI service returned no chat content: {data}")
-    return content
 
 
 def configured_provider():
@@ -273,12 +220,7 @@ def configured_provider():
 
 
 def ai_status_label():
-    provider = configured_provider()
-    if provider == "ollama":
-        return "AI ready"
-    if provider == "openai":
-        return "AI ready"
-    return "AI key missing"
+    return "AI ready" if configured_provider() in {"ollama", "openai"} else "AI key missing"
 
 
 @app.get("/")
@@ -291,9 +233,16 @@ def index():
     )
 
 
+@app.get("/health")
+def health():
+    provider = configured_provider()
+    return jsonify({"ok": True, "provider": provider or None, "configured": provider in {"ollama", "openai"}})
+
+
 @app.post("/admin/login")
 def admin_login():
-    password = request.json.get("password", "")
+    payload = request.get_json(silent=True) or {}
+    password = payload.get("password", "")
     expected = os.environ.get("ADMIN_PASSWORD", "admin123")
     if password != expected:
         return jsonify({"ok": False, "message": "Wrong admin password"}), 401
@@ -305,7 +254,8 @@ def admin_login():
 def add_brand():
     if not session.get("admin"):
         return jsonify({"ok": False, "message": "Admin login required"}), 403
-    brand = request.json.get("brand", "").strip()
+    payload = request.get_json(silent=True) or {}
+    brand = str(payload.get("brand", "")).strip()
     if not brand:
         return jsonify({"ok": False, "message": "Brand name is required"}), 400
     brands = load_brands()
@@ -333,61 +283,41 @@ def analyze():
 
     image_bytes = image.read()
     provider = configured_provider()
-    if not provider:
-        return jsonify(
-            {
-                "ok": True,
-                "result": fallback_result(
-                    "AI is not configured. Set AI_PROVIDER and the matching API key, restart the app, and analyze again."
-                ),
-            }
-        )
+    if provider != "ollama":
+        return jsonify({"ok": True, "result": fallback_result("AI image analysis requires AI_PROVIDER=ollama and a valid Ollama setup.")})
 
     try:
-        if provider == "ollama":
-            result = analyze_with_ollama(image_bytes_to_base64(image_bytes), load_brands())
-        elif provider == "openai":
-            mime_type = image.mimetype or "image/png"
-            result = analyze_with_openai(image_bytes_to_data_url(image_bytes, mime_type), load_brands())
-        else:
-            return jsonify(
-                {
-                    "ok": True,
-                    "result": fallback_result(f"Unsupported AI_PROVIDER: {provider}"),
-                }
-            )
+        result = analyze_with_ollama(base64.b64encode(image_bytes).decode("ascii"), load_brands())
     except Exception as exc:
-        return jsonify(
-            {
-                "ok": True,
-                "result": fallback_result(f"AI request failed: {exc}"),
-            }
-        )
-
+        app.logger.exception("Image analysis request failed")
+        return jsonify({"ok": True, "result": fallback_result(f"AI request failed: {exc}")})
     return jsonify({"ok": True, "result": result})
 
 
 @app.post("/chat")
 def chat():
-    message = (request.json or {}).get("message", "").strip()
+    payload = request.get_json(silent=True) or {}
+    message = str(payload.get("message", "")).strip()
     if not message:
         return jsonify({"ok": False, "message": "Type a message first"}), 400
+    if len(message) > 8000:
+        return jsonify({"ok": False, "message": "Message is too long. Keep it under 8,000 characters."}), 413
 
     provider = configured_provider()
     if provider != "ollama":
-        return jsonify(
-            {
-                "ok": False,
-                "message": "Chat is not configured.",
-            }
-        ), 400
+        return jsonify({"ok": False, "message": "AI chat is not configured. Set AI_PROVIDER=ollama, OLLAMA_BASE_URL, and OLLAMA_API_KEY in Vercel Environment Variables."}), 503
 
     try:
         reply = chat_with_ollama(message)
     except Exception as exc:
-        return jsonify({"ok": False, "message": f"Chat failed: {exc}"}), 500
-
+        app.logger.exception("Chat request failed")
+        return jsonify({"ok": False, "message": str(exc)}), 502
     return jsonify({"ok": True, "reply": reply})
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"ok": False, "message": "Upload is too large. Maximum image size is 8 MB."}), 413
 
 
 if __name__ == "__main__":
