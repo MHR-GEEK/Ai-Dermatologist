@@ -180,6 +180,25 @@ def parse_json_result(raw_text):
     return normalize_result(json.loads(cleaned), ai_available=True)
 
 
+def analyze_with_openai(image_data_url, brands):
+    from openai import OpenAI
+
+    client = OpenAI()
+    prompt = build_analysis_prompt(brands)
+    response = client.responses.create(
+        model=os.environ.get("OPENAI_MODEL", "gpt-5"),
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": image_data_url},
+            ],
+        }],
+        text={"format": {"type": "json_object"}},
+    )
+    return parse_json_result(response.output_text)
+
+
 def analyze_with_ollama(image_base64, brands):
     prompt = build_analysis_prompt(brands)
     content = ollama_chat_request(
@@ -283,11 +302,16 @@ def analyze():
 
     image_bytes = image.read()
     provider = configured_provider()
-    if provider != "ollama":
-        return jsonify({"ok": True, "result": fallback_result("AI image analysis requires AI_PROVIDER=ollama and a valid Ollama setup.")})
+    if provider not in {"ollama", "openai"}:
+        return jsonify({"ok": True, "result": fallback_result("AI is not configured. Set AI_PROVIDER and the matching provider credentials in Vercel Environment Variables.")})
 
     try:
-        result = analyze_with_ollama(base64.b64encode(image_bytes).decode("ascii"), load_brands())
+        if provider == "ollama":
+            result = analyze_with_ollama(base64.b64encode(image_bytes).decode("ascii"), load_brands())
+        else:
+            mime_type = image.mimetype or "image/png"
+            data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+            result = analyze_with_openai(data_url, load_brands())
     except Exception as exc:
         app.logger.exception("Image analysis request failed")
         return jsonify({"ok": True, "result": fallback_result(f"AI request failed: {exc}")})
